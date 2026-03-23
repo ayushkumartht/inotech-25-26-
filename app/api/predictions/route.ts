@@ -1,320 +1,261 @@
 import { NextResponse } from "next/server"
-import { GoogleGenerativeAI } from "@google/generative-ai"
+import { MOCK_PREDICTIONS, type EnhancedPrediction } from "@/lib/data/mock-predictions"
+import { readFile, writeFile } from "fs/promises"
+import path from "path"
+import { generateAIJSON } from "@/lib/ai-provider"
 
-// In-memory storage for predictions
-let cachedPredictions: any[] = []
-let lastUpdateTime = 0
-const CACHE_DURATION = 6 * 60 * 60 * 1000 // 6 hours
+/* 
+  PREDICTIONS API - Gemini Solo
+  India (March 2026)
+*/
 
-interface YouTubeVideo {
-  videoId: string
-  title: string
-  viewCount: number
-  likeCount: number
-  commentCount: number
-  publishedAt: string
-  channelTitle: string
-  description: string
+const DOMAINS = ["Tech", "Education", "Entertainment", "Food"] as const
+const REDDIT_SUBS = ["Delhi", "india", "IndianVideos", "indiasocial", "bollywood", "indiancreators"]
+const CACHE_FILE = path.join(process.cwd(), "predictions_cache.json")
+const INSTA_CACHE_FILE = path.join(process.cwd(), "insta_cache.json")
+const REDDIT_CACHE_FILE = path.join(process.cwd(), "reddit_cache.json")
+const CACHE_TTL = 4 * 60 * 60 * 1000 
+
+const DOMAIN_CONTEXT: Record<string, string> = {
+  Tech: "AI tools, gadget reviews, coding tutorials, startups, SaaS, smartphones, laptops, Raspberry Pi, home lab, open source, ChatGPT, automation, app reviews",
+  Education: "study tips, UPSC preparation, online courses, EdTech, career guidance, Pomodoro technique, competitive exams, skill development, finance fundamentals, Indian history",
+  Entertainment: "Bollywood, K-Pop mashups, stand-up comedy, memes, anime edits, celebrity news, AI short films, POV comedy, regional comedy, music remixes, transition reels",
+  Food: "street food ASMR, budget recipes, bento box prep, cloud coffee, one-pot meals, food challenges, thali reviews, restaurant reviews, cooking hacks, food photography",
 }
 
-interface Prediction {
-  id: number
-  videoId: string
-  title: string
-  confidence: number
-  peakIn: number
-  rating: number
-  category: string
-  brands: string[]
-  trendScore: number
-  trend: number[]
+interface RedditSignal { title: string; upvotes: number; comments: number; subreddit: string }
+
+async function fetchRedditSignals(): Promise<RedditSignal[]> {
+  try {
+    // Try reading cache from PRAW scraper first
+    try {
+      const raw = await readFile(REDDIT_CACHE_FILE, "utf-8")
+      const cached = JSON.parse(raw)
+      if (Array.isArray(cached) && cached.length > 0) return cached.slice(0, 30)
+    } catch {}
+
+    const all: RedditSignal[] = []
+    const fetches = REDDIT_SUBS.map(async (sub) => {
+      try {
+        const res = await fetch(
+          `https://www.reddit.com/r/${sub}/hot.json?limit=10&raw_json=1`,
+          { headers: { "User-Agent": "TrendPredictPro/1.0", Accept: "application/json" }, next: { revalidate: 600 } }
+        )
+        if (!res.ok) return []
+        const json = await res.json()
+        return (json?.data?.children || []).map((c: any) => ({
+          title: c.data?.title || "", upvotes: c.data?.score || 0,
+          comments: c.data?.num_comments || 0, subreddit: c.data?.subreddit || sub,
+        }))
+      } catch { return [] }
+    })
+    const results = await Promise.allSettled(fetches)
+    for (const r of results) if (r.status === "fulfilled") all.push(...r.value)
+    return all.sort((a, b) => (b.upvotes + b.comments) - (a.upvotes + a.comments)).slice(0, 30)
+  } catch { return [] }
+}
+
+interface InstaCache {
+  posts: Array<{
+    owner: string; caption: string; hashtags: string[];
+    likes: number; comments: number; content_type: string; source_profile: string;
+  }>
+  analysis: {
+    total_posts_analyzed: number;
+    top_hashtags: Array<{ tag: string; count: number }>;
+    content_type_distribution: Record<string, number>;
+    avg_likes: number; avg_comments: number;
+    top_performing_posts: Array<any>;
+    profiles_scraped: string[];
+  }
+  updated_at: string;
+}
+
+async function readInstaCache(): Promise<InstaCache | null> {
+  try {
+    const raw = await readFile(INSTA_CACHE_FILE, "utf-8")
+    const data = JSON.parse(raw)
+    if (data.success && data.posts?.length > 0) return data
+    return null
+  } catch { return null }
+}
+
+function buildInstaContext(insta: InstaCache | null): string {
+  if (!insta?.analysis) return ""
+  const a = insta.analysis
+  const topTags = (a.top_hashtags || []).slice(0, 15).map(t => `#${t.tag}(${t.count})`).join(", ")
+  const topPosts = (a.top_performing_posts || []).slice(0, 6).map((p: any, i: number) =>
+    `${i + 1}. @${p.owner}: "${(p.caption || "").slice(0, 80)}..." [${p.content_type}] L:${p.likes} C:${p.comments}`
+  ).join("\n")
+  return `
+INSTAGRAM DATA:
+Posts: ${a.total_posts_analyzed} | Avg Likes: ${a.avg_likes} | Avg Comments: ${a.avg_comments}
+Trending Hashtags: ${topTags}
+Top Posts:
+${topPosts}`
+}
+
+interface PredictionCache {
+  youtube: EnhancedPrediction[]
+  instagram: EnhancedPrediction[]
   generatedAt: string
-  price: number
-  reviews: number
-  views: number
-  engagement: number
-  momentum: string
+  source: string
 }
 
-async function fetchTrendingVideos(region = "IN", maxResults = 50): Promise<YouTubeVideo[]> {
-  const apiKey = process.env.YOUTUBE_API_KEY
-
-  if (!apiKey) {
-    console.error("[v0] YOUTUBE_API_KEY not configured")
-    throw new Error("YOUTUBE_API_KEY not configured")
-  }
-
+async function readCache(): Promise<PredictionCache | null> {
   try {
-    const response = await fetch(
-      `https://www.googleapis.com/youtube/v3/videos?part=statistics,snippet&chart=mostPopular&regionCode=${region}&maxResults=${maxResults}&key=${apiKey}`,
-    )
-
-    if (!response.ok) {
-      console.error("[v0] YouTube API error:", response.statusText)
-      throw new Error(`YouTube API error: ${response.statusText}`)
-    }
-
-    const data = await response.json()
-
-    if (!data.items) {
-      console.error("[v0] No items in YouTube response")
-      return []
-    }
-
-    return data.items.map((item: any) => ({
-      videoId: item.id,
-      title: item.snippet.title,
-      viewCount: Number.parseInt(item.statistics.viewCount || "0"),
-      likeCount: Number.parseInt(item.statistics.likeCount || "0"),
-      commentCount: Number.parseInt(item.statistics.commentCount || "0"),
-      publishedAt: item.snippet.publishedAt,
-      channelTitle: item.snippet.channelTitle,
-      description: item.snippet.description,
-    }))
-  } catch (error) {
-    console.error("[v0] Error fetching YouTube videos:", error)
-    throw error
-  }
+    const raw = await readFile(CACHE_FILE, "utf-8")
+    const data = JSON.parse(raw) as PredictionCache
+    const age = Date.now() - new Date(data.generatedAt).getTime()
+    if (age < CACHE_TTL) return data
+    return null
+  } catch { return null }
 }
 
-// List of Gemini models to try in order
-const GEMINI_MODELS = [
-  "gemini-2.0-flash-exp",
-  "gemini-2.0-flash",
-  "gemini-1.5-flash",
-  "gemini-2.5-flash",
-  "gemini-1.5-pro",
-]
+async function writeCache(data: PredictionCache) {
+  try { await writeFile(CACHE_FILE, JSON.stringify(data, null, 2), "utf-8") } catch { }
+}
 
-// Retry logic with model rotation
-async function retryWithModelRotation(
-  prompt: string,
-  apiKey: string,
-  maxRetries: number = 3,
-  initialDelayMs: number = 1000,
-): Promise<string> {
-  let lastError: any
-  const genAI = new GoogleGenerativeAI(apiKey)
+async function generateAllPredictions(
+  platform: "youtube" | "instagram",
+  redditSignals: RedditSignal[],
+  instaCtx: string,
+): Promise<EnhancedPrediction[]> {
+  const pf = platform === "youtube" ? "YouTube" : "Instagram"
+  const pid = platform === "youtube" ? "yt" : "ig"
+  const ts = Date.now()
+  const TOXIC_KEYWORDS = ["rape", "murder", "kill", "attack", "mob", "crime", "abuse", "convicted", "violence", "threat", "scam", "fraud"]
   
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    // Rotate through different models on each retry
-    const modelIndex = attempt % GEMINI_MODELS.length
-    const modelName = GEMINI_MODELS[modelIndex]
+  const filteredSignals = redditSignals.filter(s => 
+    !TOXIC_KEYWORDS.some(k => s.title.toLowerCase().includes(k))
+  )
+
+  const redditCtx = filteredSignals.length > 0
+    ? filteredSignals
+        .sort((a, b) => (b.upvotes + b.comments) - (a.upvotes + a.comments))
+        .slice(0, 25) // Slightly less for more focus
+        .map((p, i) => `${i + 1}. [r/${p.subreddit}] ${p.title} (${p.upvotes}↑)`)
+        .join("\n")
+    : ""
     
-    try {
-      console.log(`[v0] Attempt ${attempt + 1}/${maxRetries}: Trying model "${modelName}"...`)
-      const model = genAI.getGenerativeModel({ model: modelName })
-      const result = await model.generateContent(prompt)
-      const text = result.response.text()
-      console.log(`[v0] Success with model "${modelName}"`)
-      return text
-    } catch (error: any) {
-      lastError = error
-      
-      // Check if it's a retriable error (503, 429, timeout, etc.)
-      const isRetriable = 
-        error?.status === 503 || 
-        error?.status === 429 || 
-        error?.status === 500 ||
-        error?.message?.includes('overloaded') ||
-        error?.message?.includes('timeout') ||
-        error?.message?.includes('not found')
-      
-      if (!isRetriable || attempt === maxRetries - 1) {
-        throw error
+  const instaInstruction = platform === "instagram" 
+    ? "Focus on high-energy Instagram Reels, transition trends, and viral aesthetics. Provide ideas for visual styles and trending music styles."
+    : "Focus on medium-to-long form YouTube videos, tutorials, or lifestyle vlogs. Suggest structure for visuals and storytelling."
+
+  const allPredictions: EnhancedPrediction[] = []
+
+  console.log(`[AI] Starting prediction generation for ${pf}. Signals found: ${filteredSignals.length}`)
+
+  for (const domain of DOMAINS) {
+    console.log(`[AI] Generating 5 predictions for ${domain}...`)
+    const domainPrompt = `Analyst: ${pf} India Trend Expert.
+    Target: ${pf} Marketplace - ${domain} Category.
+    
+    SAFETY RULE: Use the signals below ONLY to identify positive trends, interests, or discussions. 
+    Strictly avoid generating anything related to crime, sensitive politics, or harmful behavior.
+    
+    CONTEXT:
+    Domain: ${domain} - ${DOMAIN_CONTEXT[domain]}
+    
+    SIGNALS FROM REDDIT:
+    ${redditCtx || "No specific signals, generate based on current Indian trends."}
+    
+    ${instaCtx || ""}
+    
+    TASK:
+    Generate EXACTLY 5 high-performing, positive, and distinct ${pf} trends for ${domain}.
+    ${instaInstruction}
+    
+    RULES:
+    - Output ONLY a JSON array of 5 objects.
+    - IDs: "${pid}-${domain.toLowerCase()}-N-${ts}"
+    - Confidence: 92-99
+    
+    FORMAT:
+    JSON array: {id, platform: "${platform}", domain: "${domain}", title, description, fullDescription, howToMake: {visuals: string[3], audio, script, editingStyle}, peakIn, confidence, engagement, tags: string[3]}.`
+
+    let domainParsed: EnhancedPrediction[] = []
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const result = await generateAIJSON<EnhancedPrediction>(domainPrompt, `predictions/${platform}/${domain}`)
+        if (result && result.length >= 3) { 
+          domainParsed = result
+          break
+        }
+      } catch (e) {
+        console.error(`[AI] Domain ${domain} Attempt ${attempt} failed.`)
       }
-      
-      console.log(`[v0] Model "${modelName}" failed (status: ${error?.status}), will try another model...`)
-      
-      // Exponential backoff with jitter before next attempt
-      const delayMs = initialDelayMs * Math.pow(2, attempt) + Math.random() * 1000
-      console.log(`[v0] Waiting ${Math.round(delayMs)}ms before retry...`)
-      
-      await new Promise(resolve => setTimeout(resolve, delayMs))
+      if (attempt < 3) await new Promise(r => setTimeout(r, 1000 * attempt))
+    }
+
+    if (domainParsed.length > 0) {
+      allPredictions.push(...domainParsed)
+    } else {
+      console.warn(`[AI] Domain ${domain} failed, falling back to MOCK for this domain.`)
+      allPredictions.push(...MOCK_PREDICTIONS.filter(p => p.platform === platform && p.domain === domain).slice(0, 5))
     }
   }
-  
-  throw lastError
+
+  return allPredictions.length > 0 ? allPredictions : MOCK_PREDICTIONS.filter(p => p.platform === platform).slice(0, 20)
 }
 
-async function analyzeWithGemini(videos: YouTubeVideo[]): Promise<any[]> {
-  if (videos.length === 0) {
-    return []
-  }
-
-  const videosSummary = videos
-    .map(
-      (v, idx) =>
-        `Video ${idx + 1}: "${v.title}" | Views: ${v.viewCount.toLocaleString()} | Likes: ${v.likeCount.toLocaleString()} | Comments: ${v.commentCount.toLocaleString()} | Channel: ${v.channelTitle}`,
-    )
-    .join("\n")
-
-  const prompt = `You are a trend analyst. Analyze these YouTube trending videos using 26 factors:
-
-26-Factor Analysis Framework:
-1. Growth Velocity 2. Engagement Rate 3. Content Quality 4. Historical Performance 5. Seasonality
-6. Competitor Analysis 7. Demographic Appeal 8. Platform Potential 9. Sentiment Analysis 10. Viral Coefficient
-11. Audience Retention 12. Content Maturity 13. Format Popularity 14. Niche Saturation 15. Influencer Potential
-16. Commercial Viability 17. Geo-Targeting (India) 18. Time Sensitivity 19. Hashtag Potential 20. Collaboration Opportunities
-21. Audience Loyalty 22. Conversion Potential 23. Brand Safety 24. Content Authenticity 25. Social Amplification
-26. Market Timing
-
-Videos to analyze:
-${videosSummary}
-
-For each video, return a JSON array with objects containing:
-- videoId: original video ID
-- title: video title
-- confidence: 85-100 confidence score
-- peakIn: 12-48 hours until peak
-- rating: 3.5-5 quality rating
-- category: category name
-- brands: array of 2-3 related brands
-- trendScore: 75-100 score
-
-Return ONLY valid JSON array, no other text, no markdown, no code blocks.`
+export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url)
+  const platformParam = searchParams.get("platform")?.toLowerCase()
+  const platform = (platformParam === "youtube" || platformParam === "instagram") ? platformParam : null
+  const forceRefresh = searchParams.get("refresh") === "true"
 
   try {
-    const apiKey = process.env.GOOGLE_AI_API_KEY
-    if (!apiKey) {
-      throw new Error("GOOGLE_AI_API_KEY not configured")
-    }
+    if (!forceRefresh) {
+      const cached = await readCache()
+      if (cached) {
+        let p = platform ? (platform === "youtube" ? cached.youtube : cached.instagram) : [...cached.youtube, ...cached.instagram]
+        
+        // SAFE FALLBACK: If cache has empty arrays, use mock data
+        if (p.length === 0) {
+          p = MOCK_PREDICTIONS.filter(x => platform ? x.platform === platform : true)
+        }
 
-    // Use retry logic with model rotation
-    let text = await retryWithModelRotation(prompt, apiKey, 3, 1000)
-
-    console.log("[v0] Gemini response received successfully")
-
-    const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/)
-    if (jsonMatch) {
-      text = jsonMatch[1].trim()
-    }
-
-    // Parse JSON response
-    const predictions = JSON.parse(text)
-
-    if (!Array.isArray(predictions)) {
-      console.error("[v0] Gemini response is not an array:", text.substring(0, 100))
-      return []
-    }
-
-    return predictions.map((p: any) => ({
-      videoId: p.videoId || "",
-      title: p.title || "Unknown Trend",
-      confidence: Math.min(100, Math.max(85, p.confidence || 90)),
-      peakIn: Math.max(12, Math.min(48, p.peakIn || 24)),
-      rating: Math.min(5, Math.max(3.5, p.rating || 4.5)),
-      category: p.category || "Entertainment",
-      brands: Array.isArray(p.brands) ? p.brands.slice(0, 3) : [],
-      trendScore: Math.min(100, Math.max(75, p.trendScore || 85)),
-      generatedAt: new Date().toISOString(),
-    }))
-  } catch (error) {
-    console.error("[v0] Gemini analysis error after all model attempts:", error)
-    return []
-  }
-}
-
-// Generate mock trend chart data for visualization
-function generateTrendData(): number[] {
-  const data: number[] = []
-  let current = Math.random() * 20
-
-  for (let i = 0; i < 9; i++) {
-    current += Math.random() * 15 + 5
-    data.push(Math.min(100, Math.floor(current)))
-  }
-
-  return data
-}
-
-async function refreshPredictionsIfNeeded() {
-  const now = Date.now()
-
-  if (now - lastUpdateTime > CACHE_DURATION) {
-    console.log("[v0] Cache expired, refreshing predictions...")
-
-    try {
-      // Fetch YouTube videos
-      console.log("[v0] Fetching YouTube trending videos...")
-      const videos = await fetchTrendingVideos()
-
-      if (!videos || videos.length === 0) {
-        console.error("[v0] No videos fetched from YouTube")
-        return
+        const ageMs = Date.now() - new Date(cached.generatedAt).getTime()
+        const canRefresh = ageMs >= CACHE_TTL
+        return NextResponse.json({
+          success: true, predictions: p, count: p.length,
+          source: cached.source + " (cached)", generatedAt: cached.generatedAt,
+          canRefresh, nextRefreshIn: canRefresh ? 0 : Math.ceil((CACHE_TTL - ageMs) / 60000),
+          debug_platform: platform,
+        })
       }
-
-      console.log("[v0] Fetched", videos.length, "YouTube videos")
-
-      // Analyze with Gemini
-      console.log("[v0] Analyzing videos with Gemini...")
-      const predictions = await analyzeWithGemini(videos)
-
-      if (!predictions || predictions.length === 0) {
-        console.error("[v0] No predictions generated")
-        return
-      }
-
-      console.log("[v0] Generated", predictions.length, "predictions")
-
-      // Format for frontend
-      cachedPredictions = predictions.map((p: any, idx: number) => ({
-        id: idx + 1,
-        ...p,
-        price: 15,
-        reviews: Math.floor(Math.random() * 200) + 50,
-        trend: generateTrendData(),
-        views: Math.floor(Math.random() * 500000) + 100000,
-        engagement: Math.floor(Math.random() * 40) + 10,
-        momentum: ["🔥 Rising", "📈 Strong", "💪 Steady"][Math.floor(Math.random() * 3)],
-      }))
-
-      lastUpdateTime = now
-      console.log("[v0] Successfully updated predictions:", cachedPredictions.length)
-    } catch (error) {
-      console.error("[v0] Error refreshing predictions:", error)
-      // Keep old predictions if refresh fails
     }
-  }
-}
 
-export async function GET() {
-  try {
-    await refreshPredictionsIfNeeded()
+    const [redditSignals, instaCache] = await Promise.all([fetchRedditSignals(), readInstaCache()])
+    const instaCtx = buildInstaContext(instaCache)
+    const ytPredictions = await generateAllPredictions("youtube", redditSignals, instaCtx)
+    const igPredictions = await generateAllPredictions("instagram", redditSignals, instaCtx)
+
+    const source = (ytPredictions.length > 0 ? "gemini_ai" : "mock") + (redditSignals.length > 0 ? " + reddit" : "")
+    const cacheData: PredictionCache = {
+      youtube: ytPredictions, instagram: igPredictions,
+      generatedAt: new Date().toISOString(), source
+    }
+    await writeCache(cacheData)
+
+    let predictions = platform ? (platform === "youtube" ? ytPredictions : igPredictions) : [...ytPredictions, ...igPredictions]
+    
+    // SAFE FALLBACK: If combined result is empty, use mock data
+    if (predictions.length === 0) {
+      console.log(`[API] Results empty for ${platform || 'all'}, falling back to MOCK_PREDICTIONS`)
+      predictions = MOCK_PREDICTIONS.filter(p => platform ? p.platform === platform : true)
+    }
 
     return NextResponse.json({
-      success: true,
-      predictions: cachedPredictions,
-      count: cachedPredictions.length,
-      cacheExpires: new Date(lastUpdateTime + CACHE_DURATION).toISOString(),
-      nextRefresh: new Date(lastUpdateTime + CACHE_DURATION).toISOString(),
+      success: true, predictions, count: predictions.length,
+      source, generatedAt: cacheData.generatedAt,
+      canRefresh: false, nextRefreshIn: Math.ceil(CACHE_TTL / 60000),
+      debug_platform: platform,
     })
   } catch (error) {
-    console.error("[v0] Get predictions error:", error)
-    return NextResponse.json(
-      { success: false, error: "Failed to fetch predictions", details: String(error) },
-      { status: 500 },
-    )
-  }
-}
-
-
-// Manual trigger for immediate refresh
-export async function POST() {
-  try {
-    lastUpdateTime = 0 // Force refresh
-    await refreshPredictionsIfNeeded()
-
-    return NextResponse.json({
-      success: true,
-      predictions: cachedPredictions,
-      message: "Predictions refreshed successfully",
-    })
-  } catch (error) {
-    console.error("[v0] Manual refresh error:", error)
-    return NextResponse.json(
-      { success: false, error: "Failed to refresh predictions", details: String(error) },
-      { status: 500 },
-    )
+    let p = MOCK_PREDICTIONS
+    if (platform) p = p.filter(x => x.platform === platform)
+    return NextResponse.json({ success: true, predictions: p, source: "fallback" })
   }
 }

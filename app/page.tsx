@@ -1,10 +1,5 @@
-import { MainLayout } from "@/components/layout"
-import { Dashboard } from "@/components/dashboard"
+import { LandingPage } from "@/components/landing-page"
 
 export default function Home() {
-  return (
-    <MainLayout>
-      <Dashboard />
-    </MainLayout>
-  )
+  return <LandingPage />
 }

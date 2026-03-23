@@ -25,3 +25,8 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# cache files
+.cache/
+predictions_cache.json
+reddit_cache.json
